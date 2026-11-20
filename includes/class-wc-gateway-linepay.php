@@ -14,6 +14,10 @@ class WC_Gateway_LINEPay extends WC_Payment_Gateway {
 
 	use WC_Gateway_LINEPay_Recovery;
 
+	const RECOVERY_HOOK = 'woocommerce_linepay_recover_payment';
+	const RECOVERY_GROUP = 'woocommerce-linepay';
+	const RECOVERY_DELAYS = array( 30, 90, 180, 360, 600, 900, 1200 );
+
 	protected $linepay_currency_scales;
 	protected $linepay_supported_currencies;
 	protected $linepay_supported_order_statuses;
@@ -289,25 +293,11 @@ class WC_Gateway_LINEPay extends WC_Payment_Gateway {
 	}
 
 	/**
-	 * Process the refund and return the result.
-	 *
-	 * This method is called only when the administrator processes it.
-	 * When the administrator requests a refund, the process_refund() method is called through WC_AJAX::refund_line_items().
-	 *
-	 * The woocommerce_delete_shop_order_transients action
-	 * This action occurs immediately before woocommerce completes the refund process when a manager requests a refund and gives a json response.
-	 *
-	 * @see WC_AJAX::refund_line_items()
-	 * @see	woocommerce::action - woocommerce_delete_shop_order_transients
-	 * @param int $order_id
-	 * @param float $amount
-	 * @param string $reason
-	 * @return bool|WP_Error
+	 * WooCommerce calls this after creating an administrator refund.
 	 */
 	public function process_refund( $order_id, $amount = null, $reason = '' ) {
 		return $this->process_refund_request( WC_Gateway_LINEPay_Const::USER_STATUS_ADMIN, $order_id, $amount, $reason );
 	}
-
 
 	/**
 	 * Call LINE Pay's reserve-api and return the result.
@@ -406,11 +396,11 @@ class WC_Gateway_LINEPay extends WC_Payment_Gateway {
 				(string) $order->get_meta( '_linepay_reserved_transaction_id' ) === $transaction_id ) {
 				$expected_state = (string) $order->get_meta( '_linepay_callback_state' );
 				$trusted = '' !== $expected_state && hash_equals( $expected_state, $state );
-				$legacy = '' === $expected_state;
-				if ( $trusted || ( $legacy && current_user_can( 'view_order', $order_id ) ) ) {
+					$legacy_authorized = '' === $expected_state && $this->legacy_browser_order_authorized( $order );
+					if ( $trusted || $legacy_authorized ) {
 					$target = $this->get_return_url( $order );
 				}
-				if ( $lock && ( $trusted || $legacy ) && $this->can_recover_payment( $order, $transaction_id ) ) {
+					if ( $lock && ( $trusted || $legacy_authorized ) && $this->can_recover_payment( $order, $transaction_id ) ) {
 					$result = $this->reconcile_payment( $order, $transaction_id, 'browser' );
 					if ( in_array( $result, array( 'review', 'authorized', 'captured_review' ), true ) ) {
 						$order->update_meta_data( '_linepay_recovery_stopped', $result );
@@ -418,10 +408,6 @@ class WC_Gateway_LINEPay extends WC_Payment_Gateway {
 						$this->add_recovery_note( $order, $result );
 					}
 					$order = wc_get_order( $order_id );
-				}
-				if ( ( $trusted || $legacy ) && $order->is_paid() && WC()->session && WC()->cart &&
-					(int) WC()->session->get( 'order_awaiting_payment' ) === $order_id ) {
-					WC()->cart->empty_cart();
 				}
 			}
 		} finally {
@@ -442,8 +428,9 @@ class WC_Gateway_LINEPay extends WC_Payment_Gateway {
 					$expected_state = (string) $order->get_meta( '_linepay_callback_state' );
 					$reserved_id = (string) $order->get_meta( '_linepay_reserved_transaction_id' );
 					$valid_state = '' !== $expected_state && hash_equals( $expected_state, $state );
-					$legacy = '' === $expected_state && $reserved_id === $transaction_id;
-					if ( ( $valid_state || $legacy ) && $this->valid_transaction_id( $reserved_id ) &&
+						$legacy_authorized = '' === $expected_state && $this->legacy_browser_order_authorized( $order );
+						$valid_transaction = $reserved_id === (string) $transaction_id || ( $valid_state && '' === (string) $transaction_id );
+						if ( ( $valid_state || $legacy_authorized ) && $valid_transaction && $this->valid_transaction_id( $reserved_id ) &&
 						$this->can_recover_payment( $order, $reserved_id ) && ! $order->get_meta( '_linepay_confirm_started' ) &&
 						$this->reservation_matches_channel( $order->get_meta( '_linepay_reservation' ) ) &&
 						'0121' === $this->request_payment_status( $reserved_id ) ) {
@@ -463,123 +450,152 @@ class WC_Gateway_LINEPay extends WC_Payment_Gateway {
 		exit;
 	}
 
-	/**
-	 * Request LINEPay's refund-api and return the result.
-	 *
-	 * @param string $requester => const:WC_Gateway_LINEPay_Const::USER_STATUS_ADMIN|CUSTOMER
-	 * @param int $order_id
-	 * @param string $refund_amount => wc_format_decimal()
-	 * @param string $reason
-	 * @return boolean(true) |WP_Error
-	 */
-	function process_refund_request ( $requester, $order_id, $refund_amount, $reason = '') {
-
-		$order             = wc_get_order( $order_id );
-		if ( false === $order) {
-
-			return new WP_Error( 'process_refund_request', sprintf( __( 'Unable to find order #%s', 'woocommerce-gateway-linepay' ), $order_id ), array(
-				'requester'     => $requester,
-				'order_id'      => $order_id,
-				'refund_amount' => $std_refund_amount,
-			));
-		}
-
-		$std_amount = $this->get_standardized( $order->get_total(), $order->get_currency() );
-		$std_refund_amount = $this->get_standardized( $refund_amount );
-		$transaction_id = $order->get_transaction_id();
-		$order_id       = $order->get_id();
-		$order_status   = $order->get_status();
-
-		// If the requester is in a non-refundable state.
-		if ( ! in_array( 'wc-' . $order_status, $this->linepay_refundable_statuses[ $requester ] ) ) {
-
-			return new WP_Error(
-				'process_refund_request',
-				__( 'Unable to refund order due to its current status.', 'woocommerce-gateway-linepay' ),
-				array(
-					'requester'      => $requester,
-					'order_id'       => $order_id,
-					'transaction_id' => $transaction_id,
-					'order_status'   => $order_status,
-				)
-			);
-		}
-
-		// Customer standard verification.
-		if ( WC_Gateway_LINEPay_Const::USER_STATUS_CUSTOMER === $requester ) {
-
-			$std_balanced_amount = $this->get_standardized( $order->get_meta( '_linepay_transaction_balanced_amount' ) , $order->get_currency() );
-			// Only the transaction itself can be canceled. No refund is possible if the refund amount is different from the total.
-			if ( $std_amount !== $std_balanced_amount ) {
-
-				return new WP_Error(
-					'process_refund_request',
-					__( 'Refund amount does not match total purchase amount.', 'woocommerce-gateway-linepay' ),
-					array(
-						'requester'      => $requester,
-						'order_id'       => $order_id,
-						'transaction_id' => $transaction_id,
-						'order_status'   => $order_status,
-						'amount'         => $std_amount,
-						'refund_amount'  => $std_refund_amount,
-					)
-				);
-			}
-		}
-
-		$result = $this->request_refund_api( $order, $transaction_id, $std_refund_amount, $requester );
-
-		// When the customer successfully refunds, the order status is canceled.
-		if ( $result && $requester === WC_Gateway_LINEPay_Const::USER_STATUS_CUSTOMER ) {
-			$order->update_status( 'cancelled' );
-		}
-
-		return $result;
+	private function legacy_browser_order_authorized( $order ) {
+		$user_id = get_current_user_id();
+		return ( $user_id && ( (int) $order->get_customer_id() === $user_id || current_user_can( 'edit_shop_order', $order->get_id() ) ) ) ||
+			( WC()->session && (int) WC()->session->get( 'order_awaiting_payment' ) === (int) $order->get_id() );
 	}
 
 	/**
-	 * Call the refund API and store the information DB according to the result.
-	 * 1. Save refund information in the form of serialized array
-	 * 2. After refund, the balance of the transaction amount is stored in string form.
-	 *
-	 * @param WC_Order $order_id
-	 * @param string $transaction_id
-	 * @param number|string $refund_amount
-	 * @param string $requestrer
-	 * @return boolean(true)|WP_Error
+	 * Refund one LINE Pay transaction while holding the same order lock used by recovery.
 	 */
-	private function request_refund_api( $order, $transaction_id, $refund_amount, $requester = null ) {
+	public function process_refund_request( $requester, $order_id, $refund_amount, $reason = '' ) {
+		$lock = $this->acquire_payment_lock( $order_id );
+		if ( ! $lock ) {
+			return new WP_Error( 'linepay_refund_busy', __( 'LINE Pay is already processing this order. Try again shortly.', 'woocommerce-gateway-linepay' ) );
+		}
+		try {
+			$order = $this->fresh_order( $order_id );
+			return $this->request_refund_locked( $order, $requester, $refund_amount );
+		} finally {
+			$this->release_payment_lock( $lock );
+		}
+	}
 
-		$order_id          = $order->get_id();
-		$std_refund_amount = $this->get_standardized( $refund_amount );
+	/**
+	 * The account action refunds the provider first, then records a WooCommerce refund.
+	 * A persisted pending marker prevents a second refund when either operation fails.
+	 */
+	public function process_customer_refund( $order_id ) {
+		$lock = $this->acquire_payment_lock( $order_id );
+		if ( ! $lock ) {
+			return new WP_Error( 'linepay_refund_busy', __( 'LINE Pay is already processing this order. Try again shortly.', 'woocommerce-gateway-linepay' ) );
+		}
+		try {
+			$order = $this->fresh_order( $order_id );
+			if ( ! $order || ! get_current_user_id() || (int) $order->get_customer_id() !== get_current_user_id() ||
+				! $order->has_status( 'processing' ) || $order->get_refunds() ||
+				WC_Gateway_LINEPay_Const::PAYMENT_STATUS_CONFIRMED !== $order->get_meta( '_linepay_payment_status' ) ) {
+				return new WP_Error( 'linepay_refund_forbidden', __( 'This LINE Pay order is not eligible for a customer refund.', 'woocommerce-gateway-linepay' ) );
+			}
+			$amount = $this->payment_amount( $order );
+			$line_items = array();
+			foreach ( $order->get_items( array( 'line_item', 'fee', 'shipping' ) ) as $item_id => $item ) {
+				$taxes = $item->get_taxes();
+				$line_items[ $item_id ] = array(
+					'refund_total' => $item->get_total(),
+					'refund_tax'   => isset( $taxes['total'] ) ? $taxes['total'] : array(),
+				);
+				if ( $item->is_type( 'line_item' ) ) {
+					$line_items[ $item_id ]['qty'] = $item->get_quantity();
+				}
+			}
+			$result = $this->request_refund_locked( $order, WC_Gateway_LINEPay_Const::USER_STATUS_CUSTOMER, $amount );
+			if ( is_wp_error( $result ) ) {
+				return $result;
+			}
 
-		$url  = $this->get_request_url( WC_Gateway_LINEPay_Const::REQUEST_TYPE_REFUND, array( 'transaction_id' => $transaction_id ) );
-		$body = array( 'refundAmount' => $std_refund_amount );
-		$info = static::execute( $this, $url, $body );
+			try {
+				$refund = wc_create_refund( array(
+					'amount'         => $amount,
+					'order_id'       => $order_id,
+					'line_items'     => $line_items,
+					'refund_payment' => false,
+					'restock_items'  => true,
+				) );
+				if ( is_wp_error( $refund ) ) {
+					throw new RuntimeException( $refund->get_error_message() );
+				}
+				$refund->set_refunded_payment( true );
+				$refund->save();
+			} catch ( Throwable $error ) {
+				$order->add_order_note( __( 'LINE Pay refunded this transaction, but WooCommerce could not record the refund. Review the order before retrying.', 'woocommerce-gateway-linepay' ) );
+				static::$logger->error( 'process_customer_refund', $error->getMessage() );
+				return new WP_Error( 'linepay_refund_recording', __( 'LINE Pay refund needs merchant review before another request.', 'woocommerce-gateway-linepay' ) );
+			}
+			$order->delete_meta_data( '_linepay_refund_pending' );
+			$order->save_meta_data();
+			return true;
+		} finally {
+			$this->release_payment_lock( $lock );
+		}
+	}
 
-		// On request failure.
-		if ( is_wp_error( $info ) ) {
-			static::$logger->error( 'request_refund_api', $info );
-			return $info;
+	private function request_refund_locked( $order, $requester, $refund_amount ) {
+		if ( ! $order || $this->id !== $order->get_payment_method() ||
+			! in_array( $requester, array( WC_Gateway_LINEPay_Const::USER_STATUS_ADMIN, WC_Gateway_LINEPay_Const::USER_STATUS_CUSTOMER ), true ) ||
+			! $this->valid_transaction_id( $order->get_transaction_id() ) || $order->get_meta( '_linepay_refund_pending' ) ) {
+			return new WP_Error( 'linepay_refund_invalid', __( 'LINE Pay refund needs review before another request.', 'woocommerce-gateway-linepay' ) );
+		}
+		$allowed = (array) $this->linepay_refundable_statuses[ $requester ];
+		if ( ! in_array( 'wc-' . $order->get_status(), $allowed, true ) ) {
+			return new WP_Error( 'linepay_refund_status', __( 'Unable to refund order due to its current status.', 'woocommerce-gateway-linepay' ) );
+		}
+		$amount = $this->payment_amount( $order );
+		$balance = $order->get_meta( '_linepay_transaction_balanced_amount' );
+		if ( ! is_numeric( $refund_amount ) || '' === $amount || '' === $balance ||
+			(float) $refund_amount <= 0 || floor( (float) $refund_amount ) !== (float) $refund_amount ||
+			(float) $refund_amount > (float) $balance ||
+			( WC_Gateway_LINEPay_Const::USER_STATUS_CUSTOMER === $requester && ( (string) (int) $refund_amount !== $amount || $order->get_refunds() ) ) ) {
+			return new WP_Error( 'linepay_refund_amount', __( 'Refund amount does not match the LINE Pay balance.', 'woocommerce-gateway-linepay' ) );
 		}
 
-		// Save refund transaction information.
-		$refund_info                               = (array) maybe_unserialize( $order->get_meta( '_linepay_refund_info' ) );
-		$refund_info[ $info->refundTransactionId ] = array(
+		$order->update_meta_data( '_linepay_refund_pending', 'review' );
+		$order->save_meta_data();
+		$persisted_order = $this->fresh_order( $order->get_id() );
+		if ( ! $persisted_order || 'review' !== $persisted_order->get_meta( '_linepay_refund_pending' ) ) {
+			return new WP_Error( 'linepay_refund_unprotected', __( 'LINE Pay refund could not be safely started. Ask the merchant to review this order.', 'woocommerce-gateway-linepay' ) );
+		}
+		$refund = $this->request_refund_api( $order, (string) $order->get_transaction_id(), (int) $refund_amount, $requester );
+		if ( is_wp_error( $refund ) ) {
+			$order->add_order_note( __( 'LINE Pay refund result requires review. Check the merchant center before another refund attempt.', 'woocommerce-gateway-linepay' ) );
+		} else {
+			$order->add_order_note( __( 'LINE Pay confirmed the refund. Waiting for WooCommerce to finish the local refund record.', 'woocommerce-gateway-linepay' ) );
+		}
+		return $refund;
+	}
+
+	private function request_refund_api( $order, $transaction_id, $refund_amount, $requester ) {
+		$url = $this->get_request_url( WC_Gateway_LINEPay_Const::REQUEST_TYPE_REFUND, array( 'transaction_id' => $transaction_id ) );
+		$info = static::execute( $this, $url, array( 'refundAmount' => $refund_amount ) );
+		if ( is_wp_error( $info ) ) {
+			static::$logger->error( 'request_refund_api', $info->get_error_message() );
+			return $info;
+		}
+		if ( ! is_object( $info ) || ! isset( $info->refundTransactionId, $info->refundTransactionDate ) ||
+			! $this->valid_transaction_id( $info->refundTransactionId ) ) {
+			return new WP_Error( 'linepay_refund_response', __( 'LINE Pay refund response needs review.', 'woocommerce-gateway-linepay' ) );
+		}
+		$refund_info = $order->get_meta( '_linepay_refund_info' );
+		if ( ! is_array( $refund_info ) ) {
+			$refund_info = is_string( $refund_info ) && is_serialized( $refund_info )
+				? @unserialize( $refund_info, array( 'allowed_classes' => false ) )
+				: array();
+			$refund_info = is_array( $refund_info ) ? $refund_info : array();
+		}
+		if ( isset( $refund_info[ (string) $info->refundTransactionId ] ) ) {
+			return new WP_Error( 'linepay_refund_duplicate', __( 'LINE Pay returned an existing refund transaction. Ask the merchant to review this order.', 'woocommerce-gateway-linepay' ) );
+		}
+		$refund_info[ (string) $info->refundTransactionId ] = array(
 			'requester' => $requester,
 			'date'      => $info->refundTransactionDate,
 		);
+		$balance = (int) $order->get_meta( '_linepay_transaction_balanced_amount' );
 		$order->update_meta_data( '_linepay_refund_info', $refund_info );
-
-		// Amount balance revision.
-		$balanced_amount		= $order->get_meta( '_linepay_transaction_balanced_amount' );
-		$new_balanced_amount	= $this->get_standardized( floatval( $balanced_amount ) - floatval( $std_refund_amount ), $order->get_currency() );
-		$order->update_meta_data( '_linepay_transaction_balanced_amount', $new_balanced_amount );
+		$order->update_meta_data( '_linepay_transaction_balanced_amount', (string) ( $balance - $refund_amount ) );
 		$order->save_meta_data();
-
 		return true;
 	}
-
 
 	/**
 	 * Returns whether the currency is supported.

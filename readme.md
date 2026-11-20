@@ -2,6 +2,14 @@
 
 源自 LINE Pay 1.1.0 外掛的社群維護版，提供台灣 WooCommerce 商店的 LINE Pay 付款整合。
 
+## 1.1.2｜2026-11-21
+
+- LINE Pay 瀏覽器付款回跳維持 GET，付款確認時核對 `orderId`、訂單儲存的交易 ID 與高熵隨機 `state`。舊版沒有 `state` 的訂單，僅接受已登入的訂單擁有人、可編輯訂單的管理員，或相符 WooCommerce 工作階段的回跳。
+- 顧客退款改用 POST 與 WordPress 安全驗證碼，並在伺服器確認登入身分、訂單擁有人、付款與退款狀態。顧客與管理員退款共用訂單鎖，避免同時處理同一筆交易。
+- LINE Pay 確認退款成功後，才建立 WooCommerce 退款並處理商品庫存。若 LINE Pay 回應不明，或 WooCommerce 無法記錄退款，訂單會留下待核對標記與備註；請先在 LINE Pay 合作商店中心確認退款結果，再人工處理該訂單。
+- LINE Pay 退款失敗時，不會將原訂單誤改成已取消，也不會自動重送可能已成功的退款。
+- 付款回跳不再由外掛直接清空購物車，避免清掉顧客在付款期間新加入的商品。
+
 ## 1.1.1｜2026-11-21
 
 付款請求成功後，外掛保留原本的結帳回跳，並使用 Action Scheduler 安排背景查詢。排程以 LINE Pay 建立交易的時間為基準，約在 **30 秒、90 秒、3 分鐘、6 分鐘、10 分鐘、15 分鐘及 20 分鐘**查詢。實際執行時間取決於商店排程的運作情況。
@@ -18,6 +26,8 @@
 在 WooCommerce 後台開啟 LINE Pay 訂單，從「訂單操作」選擇「LINE Pay 付款對帳」。這個動作向 LINE Pay 查詢交易狀態與明細，並在核對到符合條件的已請款交易後補記 WooCommerce 付款。如果原訂單已有付款日期，外掛會留下核對結果供人工確認。
 
 ## 安裝與驗證
+
+可在 PHP 8.5 CLI 執行 `php tests/linepay-regression.php`。測試以記憶體模擬 WooCommerce 與 LINE Pay，不會對真實交易發送請求。
 
 1. 在已啟用 WooCommerce 的 WordPress 商店安裝並啟用外掛。升級時沿用原外掛目錄。
 2. 在 WooCommerce → 設定 → 付款啟用 LINE Pay，並設定對應環境的 Channel ID 和 Channel Secret Key。需要分店標記時，可填寫選填的分店名稱。

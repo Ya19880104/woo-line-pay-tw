@@ -7,10 +7,6 @@ defined( 'ABSPATH' ) || exit;
  */
 trait WC_Gateway_LINEPay_Recovery {
 
-	const RECOVERY_HOOK = 'woocommerce_linepay_recover_payment';
-	const RECOVERY_GROUP = 'woocommerce-linepay';
-	const RECOVERY_DELAYS = array( 30, 90, 180, 360, 600, 900, 1200 );
-
 	private function acquire_payment_lock( $order_id ) {
 		global $wpdb;
 		$name = 'wc_linepay_' . md5( DB_NAME . ':' . $wpdb->prefix . ':' . $order_id );
@@ -302,7 +298,7 @@ trait WC_Gateway_LINEPay_Recovery {
 
 	private function complete_recovered_payment( $order, $transaction_id, $amount ) {
 		// Admin or a WooCommerce integration may have changed the order while the API was responding.
-		$order = wc_get_order( $order->get_id() );
+		$order = $this->fresh_order( $order->get_id() );
 		if ( ! $this->can_recover_payment( $order, $transaction_id )
 			|| $amount !== $this->payment_amount( $order ) ) {
 			return 'captured_review';
@@ -313,6 +309,16 @@ trait WC_Gateway_LINEPay_Recovery {
 			return 'paid';
 		}
 		return 'captured_review';
+	}
+
+	public static function fresh_order( $order_id ) {
+		if ( class_exists( 'Automattic\\WooCommerce\\Caches\\OrderCache' ) ) {
+			$cache = wc_get_container()->get( 'Automattic\\WooCommerce\\Caches\\OrderCache' );
+			$cache->remove( $order_id );
+		}
+		wp_cache_delete( $order_id, 'posts' );
+		wp_cache_delete( $order_id, 'post_meta' );
+		return wc_get_order( $order_id );
 	}
 
 	private function add_recovery_note( $order, $result ) {

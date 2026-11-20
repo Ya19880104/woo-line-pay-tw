@@ -6,7 +6,7 @@
 	$(document).ready(function() {
 		
 		function restoreClickBinder(el) {
-			var lang_pack = linepay_lang_pack();
+			var lang_pack = linepayRefundText;
 			
 			el.bind('click', requestCancelByCustomer);
 			el.text(lang_pack.cancel);
@@ -16,7 +16,7 @@
 			evt.stopPropagation();
 			evt.preventDefault();
 			
-			var lang_pack = linepay_lang_pack();
+			var lang_pack = linepayRefundText;
 			var el = $(evt.target);
 			if (!el || el.prop('tagName') !== 'A') {
 				console.error('The Element is not an \'A\' tag for cancel');
@@ -31,11 +31,15 @@
 			el.unbind('click');
 			el.text(lang_pack.process_refund);
 			
+			var refundUrl = new URL(el.prop('href'));
+			var refundNonce = refundUrl.searchParams.get('_wpnonce');
+			refundUrl.searchParams.delete('_wpnonce');
 			$.ajax({
-				url : el.prop('href'),
-				type : 'GET',
+				url : refundUrl.toString(),
+				type : 'POST',
+				data: { _wpnonce: refundNonce },
 				cache: false,
-				contentType: 'application/json; charset=UTF-8'
+				dataType: 'json'
 			}).done(function(response) {
 				
 				if (!response.success) {

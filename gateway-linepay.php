@@ -5,7 +5,7 @@
  * Description: LINE Pay Gateway for Taiwan
  * Author: LINE Pay
  * Author URI: https://pay.line.me
- * Version: 1.1.1
+ * Version: 1.1.2
  * License: GPL-3.0-or-later
  * License URI: https://www.gnu.org/licenses/gpl-3.0.html
  *
@@ -84,6 +84,7 @@ class WC_Gateway_LINEPay_Handler {
 		add_action( WC_Gateway_LINEPay::RECOVERY_HOOK, array( $this, 'recover_payment' ), 10, 3 );
 		add_filter( 'woocommerce_order_actions', array( $this, 'add_reconcile_order_action' ), 10, 2 );
 		add_action( 'woocommerce_order_action_linepay_reconcile_payment', array( $this, 'reconcile_order_payment' ) );
+		add_action( 'woocommerce_refund_created', array( $this, 'finish_admin_refund' ), 10, 2 );
 
 		// linepay setting.
 		$this->linepay_settings = (array) get_option( 'woocommerce_' . WC_Gateway_LINEPay_Const::ID . '_settings', array() );
@@ -115,6 +116,10 @@ class WC_Gateway_LINEPay_Handler {
 	}
 
 	public function add_reconcile_order_action( $actions, $order = null ) {
+		if ( ! $order instanceof WC_Order ) {
+			global $theorder;
+			$order = $theorder;
+		}
 		if ( $order instanceof WC_Order && WC_Gateway_LINEPay_Const::ID === $order->get_payment_method() &&
 			$order->get_meta( '_linepay_reserved_transaction_id' ) && current_user_can( 'edit_shop_order', $order->get_id() ) ) {
 			$actions['linepay_reconcile_payment'] = __( 'LINE Pay 付款對帳', 'woocommerce-gateway-linepay' );
@@ -127,6 +132,26 @@ class WC_Gateway_LINEPay_Handler {
 			$gateway = new WC_Gateway_LINEPay();
 			$gateway->reconcile_order_payment( $order->get_id() );
 		}
+	}
+
+	public function finish_admin_refund( $refund_id, $args ) {
+		if ( empty( $args['refund_payment'] ) || empty( $args['order_id'] ) ) {
+			return;
+		}
+		$order_id = absint( $args['order_id'] );
+		add_action( 'shutdown', function () use ( $refund_id, $order_id ) {
+			$refund = WC_Gateway_LINEPay::fresh_order( $refund_id );
+			$order = WC_Gateway_LINEPay::fresh_order( $order_id );
+			if ( ! $refund instanceof WC_Order_Refund || ! $order instanceof WC_Order ||
+				! method_exists( $refund, 'get_refunded_payment' ) ||
+				(int) $refund->get_parent_id() !== $order_id || ! $refund->get_refunded_payment() ||
+				WC_Gateway_LINEPay_Const::ID !== $order->get_payment_method() ||
+				'review' !== $order->get_meta( '_linepay_refund_pending' ) ) {
+				return;
+			}
+			$order->delete_meta_data( '_linepay_refund_pending' );
+			$order->save_meta_data();
+		}, PHP_INT_MAX );
 	}
 
 	/**
@@ -142,125 +167,35 @@ class WC_Gateway_LINEPay_Handler {
 		$gateway = new WC_Gateway_LINEPay();
 		switch ( $request_type ) {
 			case WC_Gateway_LINEPay_Const::REQUEST_TYPE_CONFIRM:
+				if ( ! isset( $_SERVER['REQUEST_METHOD'] ) || 'GET' !== $_SERVER['REQUEST_METHOD'] ||
+					(string) $order_id !== $this->callback_parameter( 'orderId' ) ) {
+					return;
+				}
 				$gateway->process_payment_confirm( $order_id, $this->callback_parameter( 'transactionId' ), $this->callback_parameter( 'linepay_state' ) );
 				break;
 			case WC_Gateway_LINEPay_Const::REQUEST_TYPE_CANCEL:
+				if ( ! isset( $_SERVER['REQUEST_METHOD'] ) || 'GET' !== $_SERVER['REQUEST_METHOD'] ||
+					( '' !== $this->callback_parameter( 'orderId' ) && (string) $order_id !== $this->callback_parameter( 'orderId' ) ) ) {
+					return;
+				}
 				$gateway->process_payment_cancel( $order_id, $this->callback_parameter( 'transactionId' ), $this->callback_parameter( 'linepay_state' ) );
 				break;
 			case WC_Gateway_LINEPay_Const::REQUEST_TYPE_REFUND:
-				$order = wc_get_order( $order_id );
-				if ( $order && WC_Gateway_LINEPay_Const::ID === $order->get_payment_method()
-					&& WC_Gateway_LINEPay_Const::PAYMENT_STATUS_CONFIRMED === $order->get_meta( '_linepay_payment_status' )
-					&& get_current_user_id() && (int) $order->get_customer_id() === get_current_user_id()
-					&& wp_verify_nonce( $this->callback_parameter( '_wpnonce' ), 'linepay_refund_' . $order_id ) ) {
-					$this->process_refund_by_customer( $gateway, $order_id );
+				if ( ( ! isset( $_SERVER['REQUEST_METHOD'] ) || 'POST' !== $_SERVER['REQUEST_METHOD'] ) || ! wp_verify_nonce( $this->callback_parameter( '_wpnonce' ), 'linepay_refund_' . $order_id ) ) {
+					wp_send_json_error( array( 'info' => __( 'Invalid refund request.', 'woocommerce-gateway-linepay' ) ), 403 );
 				}
+				$result = $gateway->process_customer_refund( $order_id );
+				if ( is_wp_error( $result ) ) {
+					wp_send_json_error( array( 'info' => $result->get_error_message() ), 400 );
+				}
+				wp_send_json_success( array( 'info' => 'fully_refunded' ) );
 				break;
 		}
 	}
 
 	private function callback_parameter( $name ) {
-		return isset( $_GET[ $name ] ) && is_string( $_GET[ $name ] ) ? wp_unslash( $_GET[ $name ] ) : '';
-	}
-
-	/**
-	 * Process the user's refund request.
-	 *
-	 * If the user requests a refund, WC_AJAX::refund_line_items() is executed when the administrator requests.
-	 * Since it cannot be called first, define a new method to handle it.
-	 *
-	 * Create a refund order to return the quantity, total amount, tax, and request a refund.
-	 *
-	 * @see	WC_AJAX::refund_line_items()
-	 * @param WC_Gateway_LINEPay $linepay_gateway
-	 * @param int $order_id
-	 * @throws Exception
-	 */
-	public function process_refund_by_customer( $linepay_gateway, $order_id ) {
-		$order         = wc_get_order( $order_id );
-		$refund_amount = wc_format_decimal( $this->callback_parameter( 'cancel_amount' ) );
-		$refund_reason = sanitize_text_field( $this->callback_parameter( 'reason' ) );
-
-
-		$line_items       = array();
-		$items            = $order->get_items();
-		$shipping_methods = $order->get_shipping_methods();
-
-		// items.
-		foreach ( $items as $item_id => $item ) {
-			$line_tax_data          = unserialize( $item['line_tax_data'] );
-			$line_item              = array(
-				'qty'          => $item['qty'],
-				'refund_total' => wc_format_decimal( $item['line_total'] ),
-				'refund_tax'   => $line_tax_data['total'],
-			);
-			$line_items[ $item_id ] = $line_item;
-		}
-
-		// shipping.
-		foreach ( $shipping_methods as $shipping_id => $shipping ) {
-			$line_item                  = array(
-				'refund_total' => wc_format_decimal( $shipping['cost'] ),
-				'refund_tax'   => unserialize( $shipping['taxes'] ),
-			);
-			$line_items[ $shipping_id ] = $line_item;
-		}
-
-		$refund = null;
-		try {
-			$refund = wc_create_refund(
-				array(
-					'amount'     => $refund_amount,
-					'reason'     => $refund_reason,
-					'order_id'   => $order_id,
-					'line_items' => $line_items,
-				)
-			);
-
-			if ( is_wp_error( $refund ) ) {
-				throw new Exception( $refund->get_error_message() );
-			}
-
-			// Refund processing
-			$result = $linepay_gateway->process_refund_request( WC_Gateway_LINEPay_Const::USER_STATUS_CUSTOMER, $order_id, $refund_amount, $refund_reason );
-
-			if ( is_wp_error( $result ) || ! $result ) {
-				static::$logger->error( 'process_refund_request_by_customer', $result );
-
-				throw new Exception( $result->get_error_message() );
-			}
-
-			// Item quantity return.
-			foreach ( $items as $item_id => $item ) {
-				$qty      = $item['qty'];
-				$_product = $order->get_product_from_item( $item );
-
-				if ( $_product && $_product->exists() && $_product->managing_stock() ) {
-					$old_stock = wc_stock_amount( $_product->stock );
-
-					$new_quantity = wc_update_product_stock( $_product, $qty, 'increase', true );
-
-					$order->add_order_note( sprintf( __( 'Item #%s stock increased from %s to %s.', 'woocommerce' ), $order_item['product_id'], $old_stock, $new_quantity ) );
-
-					do_action( 'woocommerce_restock_refunded_item', $_product->id, $old_stock, $new_quantity, $order );
-				}
-			}
-
-			wc_delete_shop_order_transients( $order_id );
-
-			wc_add_notice( __( 'Refund complete.', 'woocommerce_gateway_linepay' ) );
-			wp_send_json_success( array( 'info' => 'fully_refunded' ) );
-
-		} catch ( Exception $e ) {
-
-			if ( $refund && is_a( $refund, 'WC_Order_Refund' ) ) {
-				wp_delete_post( $refund->id, true );
-			}
-
-			wc_add_wp_error_notices( new WP_Error( 'process_refund_by_customer', __( 'Unable to process refund. Please try again.', 'woocommerce_gateway_linepay' ) ) );
-			wp_send_json_error( array( 'info' => $e->getMessage() ) );
-		}
-
+		$source = '_wpnonce' === $name ? $_POST : $_GET;
+		return isset( $source[ $name ] ) && is_string( $source[ $name ] ) ? wp_unslash( $source[ $name ] ) : '';
 	}
 
 	/**
@@ -273,26 +208,14 @@ class WC_Gateway_LINEPay_Handler {
 	 * @return String
 	 */
 	public function append_script_for_refund_action( $title ) {
-
-		// Registration of consumer refund processing script.
-		wp_register_script( 'wc-gateway-linepay-customer-refund-action', untrailingslashit( plugins_url( '/', __FILE__ ) ) . WC_Gateway_LINEPay_Const::RESOURCE_JS_CUSTOMER_REFUND_ACTION );
-		wp_enqueue_script( 'wc-gateway-linepay-customer-refund-action' );
-
-		// Register language information to be used in script.
-		$lang_process_refund = __( 'Processing refund...', 'woocommerce-gateway-linepay' );
-		$lang_request_refund = __( 'Request refund for order {order_id}', 'woocommerce-gateway-linepay' );
-		$lang_cancel         = __( 'Cancel', 'woocommerce-gateway-linepay' );
-
-		$lang_script = '<script>
-					function linepay_lang_pack() {
-						return { \'process_refund\': \'' . $lang_process_refund . '\',
-								\'request_refund\':\'' . $lang_request_refund . '\',
-								\'cancel\':\'' . $lang_cancel . '\'
-							};
-					}
-				</script>';
-		echo $lang_script;
-
+		$handle = 'wc-gateway-linepay-customer-refund-action';
+		wp_register_script( $handle, untrailingslashit( plugins_url( '/', __FILE__ ) ) . WC_Gateway_LINEPay_Const::RESOURCE_JS_CUSTOMER_REFUND_ACTION, array( 'jquery' ), '1.1.2', true );
+		wp_localize_script( $handle, 'linepayRefundText', array(
+			'process_refund' => __( 'Processing refund...', 'woocommerce-gateway-linepay' ),
+			'request_refund' => __( 'Request refund for order {order_id}', 'woocommerce-gateway-linepay' ),
+			'cancel'         => __( 'Cancel', 'woocommerce-gateway-linepay' ),
+		) );
+		wp_enqueue_script( $handle );
 		return $title;
 	}
 
@@ -316,6 +239,9 @@ class WC_Gateway_LINEPay_Handler {
 		if ( 'failed' === $order_status ) {
 			unset( $actions['cancel'] );
 		}
+		if ( $order->get_refunds() || $order->get_meta( '_linepay_refund_pending' ) ) {
+			return $actions;
+		}
 		$refundable = isset( $this->linepay_settings['customer_refund'] ) ? (array) $this->linepay_settings['customer_refund'] : array();
 		if ( in_array( 'wc-' . $order_status, $refundable, true ) ) {
 			$actions['cancel'] = array(
@@ -323,7 +249,6 @@ class WC_Gateway_LINEPay_Handler {
 					array(
 						'request_type'  => WC_Gateway_LINEPay_Const::REQUEST_TYPE_REFUND,
 						'order_id'      => $order->get_id(),
-						'cancel_amount' => $order->get_total(),
 						'_wpnonce'      => wp_create_nonce( 'linepay_refund_' . $order->get_id() ),
 					),
 					home_url( WC_Gateway_LINEPay_Const::URI_CALLBACK_HANDLER )

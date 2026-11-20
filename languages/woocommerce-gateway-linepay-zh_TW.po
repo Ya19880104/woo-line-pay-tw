@@ -48,7 +48,7 @@ msgstr "要申請訂單編號{order_id}的退款？"
 
 #: gateway-linepay.php:275 gateway-linepay.php:329
 msgid "Cancel"
-msgstr ""
+msgstr "取消"
 
 #: includes/class-wc-gateway-linepay-settings.php:46
 msgid "Enable/Disable"
@@ -341,6 +341,54 @@ msgid ""
 "LINE Pay has not returned verifiable capture details. Check again or review "
 "the payment in the merchant center."
 msgstr "LINE Pay 尚未回傳可核對的請款明細。請再查詢一次，或至合作商店中心確認付款狀態。"
+
+#: gateway-linepay.php:156
+msgid "Invalid refund request."
+msgstr "無效的退款要求。"
+
+#: includes/class-wc-gateway-linepay.php:458 includes/class-wc-gateway-linepay.php:480
+msgid "LINE Pay is already processing this order. Try again shortly."
+msgstr "LINE Pay 正在處理此訂單，請稍後再試。"
+
+#: includes/class-wc-gateway-linepay.php:487
+msgid "This LINE Pay order is not eligible for a customer refund."
+msgstr "此 LINE Pay 訂單不符合顧客退款條件。"
+
+#: includes/class-wc-gateway-linepay.php:514
+msgid "LINE Pay refunded this transaction, but WooCommerce could not record the refund. Review the order before retrying."
+msgstr "LINE Pay 已退款，但 WooCommerce 無法記錄退款。再次操作前請先核對訂單。"
+
+#: includes/class-wc-gateway-linepay.php:531
+msgid "LINE Pay refund needs review before another request."
+msgstr "再次申請退款前，請先核對 LINE Pay 退款狀態。"
+
+#: includes/class-wc-gateway-linepay.php:543
+msgid "Refund amount does not match the LINE Pay balance."
+msgstr "退款金額與 LINE Pay 可退餘額不符。"
+
+#: includes/class-wc-gateway-linepay.php:550
+msgid "LINE Pay refund result requires review. Check the merchant center before another refund attempt."
+msgstr "LINE Pay 退款結果待確認。再次退款前請先至合作商店中心查核。"
+
+#: includes/class-wc-gateway-linepay.php:564
+msgid "LINE Pay refund response needs review."
+msgstr "LINE Pay 退款回應待確認。"
+
+#: includes/class-wc-gateway-linepay.php:522
+msgid "LINE Pay refund needs merchant review before another request."
+msgstr "再次申請 LINE Pay 退款前，商店須先人工核對。"
+
+#: includes/class-wc-gateway-linepay.php:555
+msgid "LINE Pay refund could not be safely started. Ask the merchant to review this order."
+msgstr "無法安全地啟動 LINE Pay 退款。請聯絡商店核對此訂單。"
+
+#: includes/class-wc-gateway-linepay.php:556
+msgid "LINE Pay confirmed the refund. Waiting for WooCommerce to finish the local refund record."
+msgstr "LINE Pay 已確認退款，等待 WooCommerce 完成站內退款紀錄。"
+
+#: includes/class-wc-gateway-linepay.php:585
+msgid "LINE Pay returned an existing refund transaction. Ask the merchant to review this order."
+msgstr "LINE Pay 回傳既有的退款交易。請聯絡商店核對此訂單。"
 
 #~ msgid ""
 #~ "Payments are received through the LINE Pay gateway, which supports USD, "
